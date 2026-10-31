@@ -30,6 +30,7 @@ API REST en Go qui gère un catalogue de jeux de données (*datasets*) : CRUD, r
 - Documentation OpenAPI.
 - CI GitHub Actions.
 - Image distroless et sous-commande `healthcheck`.
+- TLS entre l'API et PostgreSQL (`sslmode=disable`, §6).
 
 ---
 
@@ -40,14 +41,14 @@ API REST en Go qui gère un catalogue de jeux de données (*datasets*) : CRUD, r
 | Langage | Go 1.26 (module `github.com/clemlery/datacat`) |
 | Routeur HTTP | `net/http` de la bibliothèque standard (`http.ServeMux` avec méthodes et path params) |
 | Accès BD | `github.com/jackc/pgx/v5` + `pgxpool`, SQL écrit à la main |
-| Migrations | `github.com/golang-migrate/migrate/v4` (source `iofs` sur fichiers embarqués, driver `pgx/v5`) |
+| Migrations | `github.com/golang-migrate/migrate/v4` (source `iofs` sur fichiers embarqués, driver `pgx/v5` en `WithInstance`) |
 | Normalisation Unicode | `golang.org/x/text/unicode/norm` (NFC) |
 | Logs | `log/slog`, sortie JSON |
-| Base de données | PostgreSQL 18.6 |
+| Base de données | PostgreSQL 18.6, encodage UTF-8, fournisseur de locale `builtin`, locale `C.UTF-8` |
 | Conteneurs | Podman rootless, `podman compose` (fournisseur : docker-compose) |
-| Lint | golangci-lint, linters par défaut, pas de fichier de configuration |
+| Lint | golangci-lint installé sur l'hôte, linters par défaut, pas de fichier de configuration |
 
-Les dépendances outils (CLI `migrate`) sont déclarées via la directive `tool` de `go.mod` et invoquées par `go tool`.
+Seule la CLI `migrate` est déclarée via la directive `tool` de `go.mod` et invoquée par `go tool`. golangci-lint n'y figure pas.
 
 ---
 
@@ -64,7 +65,7 @@ handlers (HTTP)  ──►  service (règles métier)  ──►  repository (SQ
 - **repository** : interface `DatasetRepository` définie côté service ; implémentation PostgreSQL (pgx). Traduit les erreurs PostgreSQL (`23505` unique_violation → `ErrConflict`, aucune ligne → `ErrNotFound`). Les opérations multi-tables (dataset + tags) s'exécutent dans une transaction.
 - **service** : validation, normalisation (§4.5), orchestration. Interface `DatasetService` consommée par les handlers.
 - **handlers** : décodage/encodage JSON, lecture des paramètres, mapping erreurs domaine → Problem Details. Aucune logique métier.
-- **main** : chargement de la config, migrations, création du pool, câblage des dépendances, démarrage du serveur, arrêt gracieux.
+- **main** : chargement de la config, création du pool et ping avec retries, migrations sur ce même pool, câblage des dépendances, démarrage du serveur, arrêt gracieux (ordre détaillé en §7.1).
 
 ### Arborescence cible
 
@@ -79,35 +80,44 @@ migrations/                    # *.up.sql / *.down.sql + migrations.go (embed.FS
 scripts/seed.sql               # fixture de vérification (§11), dev uniquement
 Containerfile
 compose.yaml
+.env.example
 Makefile
 ```
+
+Dans le squelette, `scripts/seed.sql` ne contient qu'un commentaire ; la fixture du §11.1 y est ajoutée avec le CRUD. Le `Containerfile` est complet dès le squelette (§8.1).
 
 ---
 
 ## 4. Modèle de données
 
-Toutes les longueurs de cette spec sont exprimées en **caractères Unicode (runes)**, mesurées en Go avec `utf8.RuneCountInString` et jamais avec `len()`. Exemple : `santé` fait 5 runes (6 octets).
+Toutes les longueurs de cette spec sont exprimées en **caractères Unicode (runes)**, mesurées en Go avec `utf8.RuneCountInString` et jamais avec `len()`. Exemple : `santé` fait 5 runes (6 octets). Côté SQL, `char_length` compte aussi des points de code : les deux mesures concordent.
 
 ### 4.1 Table `datasets`
 
 | Colonne | Type | Contraintes |
 |---|---|---|
 | `id` | `uuid` | PK, `DEFAULT uuidv7()` (natif PG 18) |
-| `name` | `text` | `NOT NULL`, 1 à 200 runes après normalisation, **unique** (y compris parmi les supprimés) |
-| `description` | `text` | nullable, ≤ 5 000 runes |
-| `source_url` | `text` | nullable, URL absolue (`http`, `https`, `s3`, `gs`, `ftp`, `file`) |
+| `name` | `text` | `NOT NULL`, `CHECK (char_length(name) BETWEEN 1 AND 200)`, **unique** (y compris parmi les supprimés) |
+| `description` | `text` | nullable, `CHECK (char_length(description) <= 5000)` |
+| `source_url` | `text` | nullable, URL absolue (§5.3), vérifiée uniquement en Go |
 | `format` | `text` | `NOT NULL`, `CHECK` dans la liste fermée (§4.4) |
 | `size_bytes` | `bigint` | nullable, `CHECK (size_bytes >= 0)` |
 | `row_count` | `bigint` | nullable, `CHECK (row_count >= 0)` |
-| `owner` | `text` | nullable, ≤ 200 runes |
-| `license` | `text` | nullable, ≤ 100 runes (ex. identifiant SPDX, non validé) |
-| `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` |
-| `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()`, règle de mise à jour en §5.2 |
+| `owner` | `text` | nullable, `CHECK (char_length(owner) <= 200)` |
+| `license` | `text` | nullable, `CHECK (char_length(license) <= 100)` (ex. identifiant SPDX, non validé) |
+| `created_at` | `timestamptz` | `NOT NULL DEFAULT date_trunc('second', now())` |
+| `updated_at` | `timestamptz` | `NOT NULL DEFAULT date_trunc('second', now())`, règle de mise à jour en §5.2 |
 | `deleted_at` | `timestamptz` | nullable ; non nul = dataset supprimé (soft delete) |
 
+Les `CHECK` de longueur doublent la validation Go : ils protègent la base, mais la validation Go reste la seule à produire des `422` lisibles. Ils ne recalculent aucune normalisation.
+
+**Dates à la seconde.** Toutes les dates sont stockées tronquées à la seconde : les `DEFAULT` utilisent `date_trunc('second', now())`, et chaque `UPDATE` écrit `date_trunc('second', now())`. Ce qui est lu en base est donc exactement ce qui est renvoyé en JSON (§5.1).
+
+**Pas de trigger.** `updated_at` est écrit explicitement par chaque requête `UPDATE` du repository.
+
 Index :
-- unique sur `lower(name)`, **non partiel** : unicité insensible à la casse, et le nom d'un dataset supprimé reste réservé à vie (pas de purge, §1).
-- index sur `created_at` (ordre du listing).
+- unique sur `lower(name)`, **non partiel** : unicité insensible à la casse, et le nom d'un dataset supprimé reste réservé à vie (pas de purge, §1). Le mappage de casse de `lower()` vient du fournisseur de locale `builtin` `C.UTF-8` (§8.2) : il est Unicode et déterministe, indépendant de la version de glibc. Avec une locale `C` classique, `lower('É')` renverrait `'É'` et l'unicité échouerait sur les accents.
+- composite sur `(created_at DESC, id DESC)`, qui correspond exactement à l'ordre du listing.
 
 ### 4.2 Table `tags`
 
@@ -139,11 +149,12 @@ PK `(dataset_id, tag_id)`, index sur `tag_id`.
 
 **Tags**, dans cet ordre :
 1. normalisation Unicode NFC (`santé` composé et décomposé donnent le même tag) ;
-2. `strings.TrimSpace` ;
+2. `strings.Join(strings.Fields(s), " ")` : retire les blancs de début et de fin, et ramène toute suite de blancs internes (espaces, tabulations…) à un seul espace (`"a  b"` → `"a b"`) ;
 3. `strings.ToLower`. Les accents sont conservés (`Santé` → `santé`).
 
 Après normalisation :
-- 1 à 50 runes ; lettres Unicode, chiffres, `-`, `_` et espaces internes simples ;
+- 1 à 50 runes ;
+- caractères autorisés : lettres Unicode (catégorie L), chiffres (catégorie Nd), marques combinantes (catégorie M, jamais en première position, pour les lettres sans forme précomposée), `-`, `_` et espace (forcément simple et interne après l'étape 2) ;
 - doublons dans une même requête : dédupliqués silencieusement ;
 - maximum 20 tags par dataset ;
 - les tags sont créés à la volée (`INSERT … ON CONFLICT DO NOTHING`) ;
@@ -175,7 +186,9 @@ Préfixe : `/api/v1`. Corps de requête et de réponse en JSON (`application/jso
 }
 ```
 
-Tous les champs sont toujours présents, dans toutes les réponses (lecture et listing) ; les valeurs absentes valent `null`, `tags` vaut `[]` si vide. Aucun champ supplémentaire n'est ajouté selon les paramètres. Dates en RFC 3339 UTC.
+Tous les champs sont toujours présents, dans toutes les réponses (lecture et listing) ; les valeurs absentes valent `null`, `tags` vaut `[]` si vide. Aucun champ supplémentaire n'est ajouté selon les paramètres.
+
+Dates : RFC 3339 en UTC, **à la seconde, sans fraction**, suffixe `Z` (format Go `time.RFC3339` après `.UTC()`, jamais `RFC3339Nano`).
 
 ### 5.2 Endpoints
 
@@ -195,23 +208,30 @@ Tous les champs sont toujours présents, dans toutes les réponses (lecture et l
 Règles communes :
 - `{id}` non UUID → `400`.
 - Un dataset supprimé est traité comme inexistant (`404`) par toutes les opérations sauf `GET /datasets/{id}?include_deleted=true`, `GET /datasets?include_deleted=true` et `POST …/restore`.
-- **Règle `updated_at`** : il est mis à jour à `now()` à chaque écriture réussie (`PUT`, suppression, restauration, ajout ou retrait de tag), **même si l'écriture ne change aucune valeur**. Une seule règle, pas de comparaison avant/après.
+- **Règle `updated_at`** : il est mis à jour (à la seconde) à chaque écriture réussie (`PUT`, suppression, restauration, ajout ou retrait de tag), **même si l'écriture ne change aucune valeur**. Une seule règle, pas de comparaison avant/après.
+- **Priorité des erreurs** : tout ce qui se vérifie sans la base est vérifié d'abord, dans cet ordre : `413`, `415`, `400` (id, JSON, paramètres), `422` (validation). Viennent ensuite les erreurs qui demandent la base : `404`, puis `409`. Exemple : `POST /datasets/{id}/tags/{tag}` sur un dataset supprimé avec un tag invalide → `422`.
 
 ### 5.3 Création : `POST /datasets`
 
-Corps : `name` et `format` obligatoires ; `description`, `source_url`, `size_bytes`, `row_count`, `owner`, `license`, `tags` optionnels. `id`, `created_at`, `updated_at`, `deleted_at` ne sont pas acceptés (champ inconnu → `400`).
+Corps obligatoire (corps vide → `400`). `name` et `format` obligatoires ; `description`, `source_url`, `size_bytes`, `row_count`, `owner`, `license`, `tags` optionnels. `id`, `created_at`, `updated_at`, `deleted_at` ne sont pas acceptés (champ inconnu → `400`).
+
+**Valeurs `null` explicites** : pour un champ optionnel, `null` équivaut à absent (`"tags": null` donne `[]`). Pour `name` ou `format`, `null` équivaut à absent, donc `422` (champ obligatoire).
+
+**`source_url`** : analysée avec `url.Parse`, doit avoir un schéma dans la liste `http`, `https`, `s3`, `gs`, `ftp`, `file` (comparaison insensible à la casse, valeur stockée telle que fournie).
+- `http`, `https`, `ftp`, `s3`, `gs` : hôte non vide obligatoire (pour `s3` et `gs`, l'hôte est le nom du bucket).
+- `file` : hôte vide ou `localhost`, chemin absolu non vide (`file:///data/x.csv` est valide).
 
 Erreurs : `422` validation, `409` nom déjà utilisé (casse différente comprise, dataset supprimé compris).
 
 ### 5.4 Remplacement : `PUT /datasets/{id}`
 
-Même schéma que la création. Remplace l'intégralité de la ressource : tout champ optionnel absent devient `null`, `tags` absent devient une liste vide.
+Même schéma et mêmes règles que la création (corps obligatoire, `null` explicites, `source_url`). Remplace l'intégralité de la ressource : tout champ optionnel absent ou `null` devient `null`, `tags` absent ou `null` devient une liste vide.
 
 Erreurs : `404` inexistant ou supprimé, `422` validation, `409` si le nouveau nom est déjà utilisé par un autre dataset (casse différente comprise, dataset supprimé compris). Renommer un dataset avec son propre nom, même avec une casse différente, n'est pas un conflit.
 
 ### 5.5 Suppression : `DELETE /datasets/{id}`
 
-Positionne `deleted_at = now()`. Les liaisons de tags sont conservées (pour la restauration). Dataset déjà supprimé ou inexistant → `404`.
+Positionne `deleted_at` (à la seconde). Les liaisons de tags sont conservées (pour la restauration). Dataset déjà supprimé ou inexistant → `404`.
 
 ### 5.6 Restauration : `POST /datasets/{id}/restore`
 
@@ -228,7 +248,7 @@ Paramètres de requête :
 | Paramètre | Type | Défaut | Description |
 |---|---|---|---|
 | `tag` | string, répétable | aucun | Tags recherchés, normalisés selon §4.5, maximum 20 |
-| `include_deleted` | bool (`true`/`false`) | `false` | Inclut les datasets supprimés |
+| `include_deleted` | bool | `false` | Inclut les datasets supprimés ; seules les valeurs exactes `true` et `false` (minuscules) sont acceptées |
 
 Règles :
 - sans `tag` : tous les datasets (non supprimés, sauf `include_deleted=true`) ;
@@ -236,7 +256,7 @@ Règles :
 - ordre fixe : `created_at` décroissant, puis `id` décroissant comme départage ;
 - pas de pagination : tous les résultats sont renvoyés.
 
-Paramètre invalide (plus de 20 tags, tag invalide après normalisation, `include_deleted` autre que `true`/`false`, paramètre inconnu) → **`400`**. Le `422` est réservé à la validation des corps de requête.
+Paramètre invalide → **`400`**. Sont invalides : plus de 20 tags, un `tag` vide (`?tag=`) ou invalide après normalisation, `include_deleted` autre que `true`/`false` (`TRUE`, `1`, valeur vide…), un `include_deleted` répété, tout paramètre inconnu. Le `422` est réservé à la validation des corps de requête et des tags unitaires.
 
 Réponse :
 
@@ -246,7 +266,12 @@ Réponse :
 }
 ```
 
-### 5.9 Erreurs : RFC 9457 Problem Details
+### 5.9 Corps et `Content-Type`
+
+- `POST /datasets` et `PUT /datasets/{id}` : `Content-Type` obligatoire, de type `application/json`. Paramètres acceptés : `charset=utf-8` uniquement (insensible à la casse). Tout autre type, tout autre charset ou `Content-Type` absent → `415`.
+- `POST …/restore`, `POST|DELETE …/tags/{tag}`, `DELETE /datasets/{id}` : aucun corps attendu, `Content-Type` ignoré. Corps non vide → `400`.
+
+### 5.10 Erreurs : RFC 9457 Problem Details
 
 ```json
 {
@@ -264,27 +289,31 @@ Réponse :
 
 | Statut | `type` (suffixe) | Cas |
 |---|---|---|
-| `400` | `bad-request` | JSON mal formé, champ inconnu, paramètre de requête invalide (§5.8), id non UUID |
+| `400` | `bad-request` | JSON mal formé, corps vide ou inattendu, champ inconnu, paramètre de requête invalide (§5.8), id non UUID |
 | `404` | `not-found` | Dataset inexistant ou supprimé, route inconnue |
 | `405` | `method-not-allowed` | Méthode non supportée (header `Allow`) |
 | `409` | `conflict` | Nom déjà pris (`POST` et `PUT`), restauration d'un dataset non supprimé |
 | `413` | `payload-too-large` | Corps > 1 Mio |
-| `415` | `unsupported-media-type` | `Content-Type` autre que `application/json` |
+| `415` | `unsupported-media-type` | `Content-Type` non conforme au §5.9 |
 | `422` | `validation-error` | Règles de validation des corps et des tags unitaires (avec `errors[]`) |
 | `500` | `internal-error` | Erreur inattendue (détail jamais exposé, loggé côté serveur) |
-| `503` | `unavailable` | `/readyz` quand la BD ne répond pas |
+| `503` | `unavailable` | `/readyz` quand la BD ne répond pas ou pendant l'arrêt |
 
 Le décodage JSON rejette les champs inconnus (`DisallowUnknownFields`) et les corps contenant plusieurs valeurs JSON.
+
+**404 et 405 de `ServeMux`.** Par défaut, `http.ServeMux` les renvoie en `text/plain`. Un middleware enveloppe le mux, intercepte ces deux statuts et les réécrit en Problem Details, en conservant le header `Allow` du `405`.
+
+**Dès le squelette**, un writer Problem Details minimal existe et sert au `503` de `/readyz`. Le champ `request_id` y est ajouté avec le middleware de request ID (§7.4), à l'étape suivante.
 
 ---
 
 ## 6. Configuration
 
-Variables d'environnement :
+Variables d'environnement de l'API :
 
 | Variable | Défaut | Description |
 |---|---|---|
-| `DATABASE_URL` | aucun (obligatoire) | DSN PostgreSQL |
+| `DATABASE_URL` | aucun (obligatoire) | DSN PostgreSQL, avec `?sslmode=disable` explicite (l'image postgres n'a pas de TLS, et pgx tente TLS par défaut) |
 | `HTTP_ADDR` | `:8080` | Adresse d'écoute |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `DB_MAX_CONNS` | `10` | Taille max du pool pgx |
@@ -292,14 +321,20 @@ Variables d'environnement :
 
 Config invalide ou manquante → l'application s'arrête au démarrage avec un message explicite.
 
+**Construction du DSN.** Le fichier `.env` (non versionné ; `.env.example` versionné) ne contient que `POSTGRES_USER`, `POSTGRES_PASSWORD` et `POSTGRES_DB`. `DATABASE_URL` n'y figure pas, il est construit :
+- par `compose.yaml`, par interpolation, avec l'hôte `db` : `postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable` ;
+- par le Makefile pour `make run`, avec l'hôte `127.0.0.1`.
+
+Contrainte : `POSTGRES_USER` et `POSTGRES_PASSWORD` ne doivent contenir aucun caractère à encoder dans une URL (notamment `@ : / ? #`), car le DSN est construit sans encodage. `.env.example` le rappelle en commentaire.
+
 ---
 
 ## 7. Exploitation
 
 ### 7.1 Démarrage
 1. Lecture de la configuration.
-2. Connexion à la BD avec retries (backoff exponentiel, environ 30 s max).
-3. Application des migrations embarquées (golang-migrate ; verrou consultatif natif). Échec → arrêt avec code non nul. Base en état `dirty` → arrêt avec message explicite.
+2. Création du pool `pgxpool` à partir de `DATABASE_URL`, puis ping avec retries : budget total de 30 s, premier délai de 250 ms, doublé à chaque tentative, plafonné à 4 s par attente. `SIGINT`/`SIGTERM` pendant les retries interrompt le démarrage (code 1). Budget épuisé → arrêt avec code 1 et message explicite.
+3. Application des migrations embarquées **sur ce même pool** : `stdlib.OpenDBFromPool` fournit un `*sql.DB`, passé au driver `pgx/v5` de golang-migrate via `WithInstance`. Une seule source de connexion, un seul DSN. Verrou consultatif natif de golang-migrate. Échec → arrêt avec code non nul. Base en état `dirty` → arrêt avec message explicite.
 4. Démarrage du serveur HTTP avec timeouts (`ReadHeaderTimeout` 5 s, `ReadTimeout` 15 s, `WriteTimeout` 30 s, `IdleTimeout` 60 s).
 
 ### 7.2 Migrations
@@ -309,16 +344,20 @@ Config invalide ou manquante → l'application s'arrête au démarrage avec un m
 
 ### 7.3 Healthchecks
 - `/healthz` : `200 {"status":"ok"}` dès que le processus sert des requêtes.
-- `/readyz` : ping BD avec timeout de 2 s ; `200` ou `503`.
+- `/readyz` : ping BD avec timeout de 2 s ; `200 {"status":"ok"}` ou `503` en Problem Details (§5.10).
 
 ### 7.4 Logs
 - `slog` en JSON sur stdout.
-- Middleware de request ID : réutilise `X-Request-ID` entrant s'il est présent et valide, sinon en génère un ; renvoyé dans la réponse et inclus dans chaque log et dans les Problem Details.
+- Middleware de request ID : réutilise `X-Request-ID` entrant s'il est valide, sinon en génère un. Valide = 1 à 128 caractères parmi `A-Z a-z 0-9 . _ -`. Un identifiant absent ou invalide est remplacé (sans erreur) par 32 caractères hexadécimaux issus de `crypto/rand`. L'identifiant retenu est renvoyé dans le header `X-Request-ID` de la réponse et inclus dans chaque log et dans les Problem Details.
 - Log d'accès par requête : méthode, chemin, statut, durée, taille de réponse, request ID.
 - Middleware de recover : une panique produit un `500` Problem Details et un log `error` avec stack.
 
 ### 7.5 Arrêt gracieux
-`signal.NotifyContext` sur `SIGINT`/`SIGTERM` → `/readyz` passe en `503` → `http.Server.Shutdown` avec `SHUTDOWN_TIMEOUT` → fermeture du pool pgx → sortie code 0.
+`signal.NotifyContext` sur `SIGINT`/`SIGTERM` → le flag de readiness bascule (`/readyz` répondrait `503`) → `http.Server.Shutdown` avec `SHUTDOWN_TIMEOUT`, sans délai de drainage → fermeture du pool pgx.
+- Arrêt terminé dans le délai → sortie code 0.
+- `SHUTDOWN_TIMEOUT` dépassé → log `error`, sortie code 1.
+
+Note : `Shutdown` ferme immédiatement les listeners, le `503` de `/readyz` n'est donc presque jamais observable. C'est assumé : pas de délai de drainage en v1.
 
 ---
 
@@ -335,16 +374,18 @@ Deux services :
 
 **`db`**
 - Image `docker.io/library/postgres:18.6`.
-- Variables `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` lues depuis un fichier `.env` (non versionné ; `.env.example` versionné).
+- Variables `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` lues depuis `.env`.
+- `POSTGRES_INITDB_ARGS="--encoding=UTF8 --locale-provider=builtin --builtin-locale=C.UTF-8"` (§4.1). ⚠️ Cette option n'agit qu'à la création du cluster, donc à la création du volume. La changer ensuite demande un `make reset`.
 - Volume nommé monté sur **`/var/lib/postgresql`** (et non `/var/lib/postgresql/data`) : depuis PostgreSQL 18, `PGDATA` vaut `/var/lib/postgresql/18/docker` et le `VOLUME` de l'image est `/var/lib/postgresql`. Ne pas surcharger `PGDATA`.
 - Healthcheck `pg_isready -U $POSTGRES_USER -d $POSTGRES_DB`.
-- Port publié uniquement sur `127.0.0.1:5432` (usage dev / `make seed`).
+- Port publié uniquement sur `127.0.0.1:5432` (usage dev, `make run`, `make seed`).
 
 **`api`**
 - Construite depuis le `Containerfile`.
-- `DATABASE_URL` pointant sur le service `db`.
+- `DATABASE_URL` construit par interpolation (§6).
 - `depends_on` `db` avec `condition: service_healthy`.
 - Healthcheck : `wget -q -O /dev/null http://127.0.0.1:8080/healthz`.
+- `stop_grace_period: 15s`, supérieur à `SHUTDOWN_TIMEOUT` (10 s), pour que le `SIGKILL` ne tombe pas au moment où le timeout expire.
 - Port publié `127.0.0.1:8080:8080`.
 
 Contraintes rootless : uniquement des ports > 1024 ; volumes nommés plutôt que bind mounts (si bind mount, suffixe `:Z` pour SELinux sur Fedora).
@@ -353,24 +394,26 @@ Contraintes rootless : uniquement des ports > 1024 ; volumes nommés plutôt que
 
 ## 9. Tests
 
-- **Service (unitaires)** : repository simulé par un fake en mémoire implémentant l'interface ; le fake reproduit l'unicité insensible à la casse (y compris parmi les supprimés) en renvoyant `ErrConflict`. Couvre validation, normalisation (NFC, trim, minuscules, runes), limites (20 tags, longueurs), sémantique `PUT` (champs absents → `null`), `409` sur création et renommage, règle `updated_at`, propagation des erreurs domaine.
-- **Handlers (`httptest`)** : service simulé. Couvre routage, codes de statut, décodage strict (champs inconnus, JSON invalide, taille max, `Content-Type`), parsing et validation des paramètres de listing (`400`), format Problem Details, header `Location`, request ID.
+- **Service (unitaires)** : repository simulé par un fake en mémoire implémentant l'interface ; le fake reproduit l'unicité insensible à la casse (y compris parmi les supprimés) en renvoyant `ErrConflict`. Couvre validation, normalisation (NFC, blancs, minuscules, runes, marques combinantes), limites (20 tags, longueurs), `source_url`, `null` explicites, sémantique `PUT` (champs absents → `null`), `409` sur création et renommage, règle `updated_at`, propagation des erreurs domaine.
+- **Handlers (`httptest`)** : service simulé. Couvre routage, codes de statut et leur priorité (§5.2), 404/405 du mux en Problem Details, décodage strict (champs inconnus, JSON invalide, corps vide ou inattendu, taille max, `Content-Type`), parsing et validation des paramètres de listing (`400`), format des dates, format Problem Details, header `Location`, request ID (réutilisé, remplacé si invalide).
 - Tests table-driven, `go test -race ./...`, sans dépendance à une base réelle.
-- Les règles portées par le SQL (filtre OU par tags, ordre, unicité incluant les supprimés, soft delete) sont couvertes en v1 par les cas manuels de la section 11, exécutés contre la stack compose. Leur automatisation fait partie de l'exercice de validation (§12).
+- Les règles portées par le SQL (filtre OU par tags, ordre, unicité incluant les supprimés et les accents, soft delete) sont couvertes en v1 par les cas manuels de la section 11, exécutés contre la stack compose. Leur automatisation fait partie de l'exercice de validation (§12).
 
 ---
 
 ## 10. Outillage
 
 ### Makefile
+Le Makefile lit `.env` (`include .env` + `export`) pour construire le `DATABASE_URL` de `make run`.
+
 | Cible | Action |
 |---|---|
 | `up` / `down` | `podman compose up -d --build` / `podman compose down` |
 | `logs` | Logs des services |
-| `run` | Lance l'API en local (`go run ./cmd/datacat`) contre la BD compose |
+| `run` | Démarre uniquement `db` (`podman compose up -d --wait db`), puis lance l'API en local (`go run ./cmd/datacat`) avec `DATABASE_URL` sur `127.0.0.1`. Échoue avec un message explicite si le service `api` tourne déjà (conflit sur le port 8080). |
 | `build` | Compile le binaire |
 | `test` | `go test -race ./...` |
-| `lint` | `golangci-lint run` (linters par défaut) |
+| `lint` | `golangci-lint run` (linters par défaut). Échoue avec un message explicite si `golangci-lint` n'est pas installé sur l'hôte. |
 | `seed` | Charge `scripts/seed.sql` via `podman compose exec db psql …` |
 | `reset` | Repart d'une base vide : `podman compose down -v` (supprime le volume nommé), puis `podman compose up -d --build --wait` (attend que `db` et `api` soient `healthy`, donc migrations appliquées), puis `make seed`. **Destructif** : efface toutes les données. |
 | `migrate-new` | Crée une paire de fichiers de migration |
@@ -410,6 +453,7 @@ Chaque cas part d'une fixture fraîche (`make reset`), sauf V9 et V10 qui s'ench
 | V4 | `GET /api/v1/datasets?tag=sante%CC%81` (forme décomposée) | `200`, D5, D4 (identique à V2 grâce à NFC) |
 | V5 | `GET /api/v1/datasets?tag=démographie&include_deleted=true` | `200`, D7, D4, D1 ; D7 a `deleted_at` renseigné |
 | V6 | `POST` avec `name` = `population communale 2024` | `409` (casse différente) |
+| V6b | `POST` avec `name` = `HÔPITAUX DE FRANCE` | `409` (casse différente sur une lettre accentuée, vérifie la locale `builtin`) |
 | V7 | `POST` avec `name` = `Ancien recensement 1999` | `409` (nom d'un dataset supprimé, réservé à vie) |
 | V8 | `PUT` de D6 avec `name` = `Hôpitaux de France` | `409` |
 | V9 | `DELETE` D2, puis `GET` D2 | `204`, puis `404` |
@@ -420,8 +464,8 @@ Chaque cas part d'une fixture fraîche (`make reset`), sauf V9 et V10 qui s'ench
 1. `make up` sur une machine avec Podman rootless démarre `db` et `api` ; les deux services passent `healthy` ; `/readyz` répond `200`.
 2. Un redémarrage simple (`make down && make up`, sans `-v` et donc **sans** `make reset`) conserve les données ; le volume est bien monté sur `/var/lib/postgresql`.
 3. Les migrations s'appliquent au premier démarrage et sont sans effet aux suivants.
-4. Les cas V1 à V10 (V1b compris) donnent exactement les résultats attendus.
-5. Toutes les erreurs sont au format `application/problem+json` avec `request_id`.
+4. Les cas V1 à V10 (V1b et V6b compris) donnent exactement les résultats attendus.
+5. Toutes les erreurs sont au format `application/problem+json` avec `request_id`, y compris les 404 et 405 produits par le routeur.
 6. `SIGTERM` sur l'API : les requêtes en cours se terminent, le processus sort en code 0.
 7. `make lint` et `make test` passent.
 

@@ -1,0 +1,2 @@
+-- Fixture de vérification (SPEC §11.1), ajoutée avec le CRUD.
+-- Toujours chargée via `make reset`, jamais par `make seed` seul.
